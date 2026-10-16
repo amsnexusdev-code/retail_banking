@@ -280,7 +280,54 @@ def restart_api(api_name: str):
     log.warning("API '%s' RESTARTED via admin endpoint", api_name)
     return {"restarted": api_name, "auto_stop_in_seconds": FAIL_AFTER_SECONDS}
 
+# --------------------------------------------------------------------------
+# Disk / log-version admin endpoints (used by the AMS alert module)
+# --------------------------------------------------------------------------
+_LOG_NAME_RE = re.compile(r"retail_bank\.log(?:\.(\d+))?$")
 
+
+def _check_admin(token: str):
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        raise HTTPException(403, "Invalid admin token")
+
+
+def _log_versions():
+    out = []
+    for fn in os.listdir(LOG_DIR):
+        m = _LOG_NAME_RE.fullmatch(fn)
+        if m:
+            p = os.path.join(LOG_DIR, fn)
+            out.append({"name": fn, "path": p, "size": os.path.getsize(p), "version": int(m.group(1) or 0)})
+    return out
+
+
+@app.get("/admin/disk-status")
+def disk_status(keep: int = LOG_BACKUP_COUNT, x_admin_token: str = Header(default="")):
+    _check_admin(x_admin_token)
+    u = shutil.disk_usage(LOG_DIR)
+    files = _log_versions()
+    extra = [f["name"] for f in files if f["version"] > keep]
+    pct = round(u.used / u.total * 100, 1)
+    log.info("DISK usage=%s%% used=%s total=%s log_dir_size=%s old_versions>%s=%s",
+             pct, u.used, u.total, sum(f["size"] for f in files), keep, len(extra))
+    return {"usage_percent": pct, "used_bytes": u.used, "total_bytes": u.total,
+            "log_dir_size_bytes": sum(f["size"] for f in files), "extra_versions": extra}
+
+
+@app.post("/admin/cleanup-logs")
+def cleanup_logs(dry_run: bool = True, keep: int = LOG_BACKUP_COUNT, x_admin_token: str = Header(default="")):
+    """Deletes only rotated versions retail_bank.log.N with N > keep. Never the live log."""
+    _check_admin(x_admin_token)
+    victims = [f for f in _log_versions() if f["version"] > keep]
+    freed = 0
+    for f in victims:
+        freed += f["size"]
+        if not dry_run:
+            os.remove(f["path"])
+    log.warning("DISK log cleanup %s: %s file(s), %s bytes (keep newest %s versions)",
+                "DRY-RUN" if dry_run else "EXECUTED", len(victims), freed, keep)
+    return {"dry_run": dry_run, "file_count": len(victims), "bytes": freed,
+            "files": [f["name"] for f in victims]}
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     if "--init-db" in sys.argv:
