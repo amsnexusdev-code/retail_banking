@@ -2,35 +2,37 @@
 Retail Banking demo app - single file.
 
 Contains:
-  1. DB table creation + seed script   (runs on startup, or: python retail_bank.py --init-db)
+  1. DB table creation + seed script   (runs on startup, or: python app.py --init-db)
   2. Main server (FastAPI + uvicorn)
   3. Two business APIs
        GET  /accounts/{account_number}   -> balance enquiry
        POST /transactions                -> deposit / withdraw (updates balance)
   4. A "flaky" API: after FAIL_AFTER_SECONDS the chosen API is shut down and
      returns 503 until restarted via  POST /admin/restart/{api_name}
-     (that restart hook is what your future auto-restart monitor will call)
   5. Periodic client: calls the GET and POST APIs every CLIENT_INTERVAL_SECONDS
      so logs are generated continuously (successes AND failures).
+  6. Disk monitoring: a periodic "DISK usage=..." log line, plus admin endpoints
+       GET  /admin/disk-status     -> disk usage + rotated log versions
+       POST /admin/cleanup-logs    -> delete rotated logs beyond the newest N (dry-run by default)
 
 Run:  uvicorn app:app --reload   (or: python app.py)
 """
 import logging
 import os
 import random
+import re
+import shutil
 import sys
 import threading
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
 from logging.handlers import RotatingFileHandler
-import re
-import shutil
+from urllib.parse import urlparse
 
 import requests
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -46,9 +48,13 @@ FLAKY_API = os.getenv("FLAKY_API", "post_transactions")  # or: get_account
 FAIL_AFTER_SECONDS = int(os.getenv("FAIL_AFTER_SECONDS", "180"))
 CLIENT_ENABLED = os.getenv("CLIENT_ENABLED", "true").lower() == "true"
 CLIENT_INTERVAL_SECONDS = int(os.getenv("CLIENT_INTERVAL_SECONDS", "15"))
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # if set, /admin/* endpoints need header X-Admin-Token
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "100000"))   # rotate every ~100 KB
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "4"))  # keep 4 old versions, delete older
 CLIENT_BASE_URL = os.getenv("CLIENT_BASE_URL", f"http://127.0.0.1:{PORT}")
+DISK_LOG_INTERVAL_SECONDS = int(os.getenv("DISK_LOG_INTERVAL_SECONDS", "60"))
+DISK_ALERT_PERCENT = float(os.getenv("DISK_ALERT_PERCENT", "80"))
+DISK_SIMULATE_PERCENT = float(os.getenv("DISK_SIMULATE_PERCENT", "0"))  # 0 = real value; TEST ONLY
 
 # --------------------------------------------------------------------------
 # Logging (console + rotating file)
@@ -203,12 +209,57 @@ def client_loop():
 
 
 # --------------------------------------------------------------------------
+# Disk monitoring: periodic "DISK usage=..." log line (real data for Grafana/Loki)
+# --------------------------------------------------------------------------
+_LOG_NAME_RE = re.compile(r"retail_bank\.log(?:\.(\d+))?$")
+
+
+def _log_versions():
+    """retail_bank.log (version 0) and rotated retail_bank.log.N files with their sizes."""
+    out = []
+    for fn in os.listdir(LOG_DIR):
+        m = _LOG_NAME_RE.fullmatch(fn)
+        if m:
+            p = os.path.join(LOG_DIR, fn)
+            out.append({"name": fn, "path": p, "size": os.path.getsize(p), "version": int(m.group(1) or 0)})
+    return out
+
+
+def disk_log_once():
+    u = shutil.disk_usage(LOG_DIR)
+    pct = round(u.used / u.total * 100, 1)
+    simulated = DISK_SIMULATE_PERCENT > 0
+    if simulated:
+        pct = DISK_SIMULATE_PERCENT
+    size = sum(f["size"] for f in _log_versions())
+    lvl = logging.WARNING if pct >= DISK_ALERT_PERCENT else logging.INFO
+    log.log(lvl, "DISK usage=%s%% used=%s total=%s log_dir_size=%s%s",
+            pct, u.used, u.total, size, " (SIMULATED)" if simulated else "")
+
+
+def disk_log_loop():
+    time.sleep(10)  # let the server come up
+    while True:
+        try:
+            disk_log_once()
+        except Exception as e:
+            log.error("DISK monitor failed: %s", e)
+        time.sleep(DISK_LOG_INTERVAL_SECONDS)
+
+
+def _check_admin(token: str):
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        raise HTTPException(403, "Invalid admin token")
+
+
+# --------------------------------------------------------------------------
 # App + APIs
 # --------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     flaky.start()
+    threading.Thread(target=disk_log_loop, daemon=True).start()
     if CLIENT_ENABLED:
         threading.Thread(target=client_loop, daemon=True).start()
     yield
@@ -272,51 +323,36 @@ def post_transaction(txn: Transaction):
 
 
 @app.post("/admin/restart/{api_name}")
-def restart_api(api_name: str):
-    """Hook for your future auto-restart monitor."""
+def restart_api(api_name: str, x_admin_token: str = Header(default="")):
+    """Restart hook used by the alert module. Protected by X-Admin-Token when ADMIN_TOKEN is set."""
+    _check_admin(x_admin_token)
     if api_name != flaky.api_name:
         raise HTTPException(404, f"'{api_name}' is not the managed flaky API")
     flaky.start()
     log.warning("API '%s' RESTARTED via admin endpoint", api_name)
     return {"restarted": api_name, "auto_stop_in_seconds": FAIL_AFTER_SECONDS}
 
-# --------------------------------------------------------------------------
-# Disk / log-version admin endpoints (used by the AMS alert module)
-# --------------------------------------------------------------------------
-_LOG_NAME_RE = re.compile(r"retail_bank\.log(?:\.(\d+))?$")
-
-
-def _check_admin(token: str):
-    if ADMIN_TOKEN and token != ADMIN_TOKEN:
-        raise HTTPException(403, "Invalid admin token")
-
-
-def _log_versions():
-    out = []
-    for fn in os.listdir(LOG_DIR):
-        m = _LOG_NAME_RE.fullmatch(fn)
-        if m:
-            p = os.path.join(LOG_DIR, fn)
-            out.append({"name": fn, "path": p, "size": os.path.getsize(p), "version": int(m.group(1) or 0)})
-    return out
-
 
 @app.get("/admin/disk-status")
 def disk_status(keep: int = LOG_BACKUP_COUNT, x_admin_token: str = Header(default="")):
+    """Disk usage plus rotated log versions beyond the newest `keep` ones."""
     _check_admin(x_admin_token)
     u = shutil.disk_usage(LOG_DIR)
     files = _log_versions()
     extra = [f["name"] for f in files if f["version"] > keep]
     pct = round(u.used / u.total * 100, 1)
+    size = sum(f["size"] for f in files)
     log.info("DISK usage=%s%% used=%s total=%s log_dir_size=%s old_versions>%s=%s",
-             pct, u.used, u.total, sum(f["size"] for f in files), keep, len(extra))
+             pct, u.used, u.total, size, keep, len(extra))
     return {"usage_percent": pct, "used_bytes": u.used, "total_bytes": u.total,
-            "log_dir_size_bytes": sum(f["size"] for f in files), "extra_versions": extra}
+            "log_dir_size_bytes": size, "extra_versions": extra}
 
 
 @app.post("/admin/cleanup-logs")
-def cleanup_logs(dry_run: bool = True, keep: int = LOG_BACKUP_COUNT, x_admin_token: str = Header(default="")):
-    """Deletes only rotated versions retail_bank.log.N with N > keep. Never the live log."""
+def cleanup_logs(dry_run: bool = True, keep: int = LOG_BACKUP_COUNT,
+                 x_admin_token: str = Header(default="")):
+    """Deletes only rotated versions retail_bank.log.N with N > keep. Never the live log.
+    Dry-run by default; pass dry_run=false to actually delete."""
     _check_admin(x_admin_token)
     victims = [f for f in _log_versions() if f["version"] > keep]
     freed = 0
@@ -328,6 +364,8 @@ def cleanup_logs(dry_run: bool = True, keep: int = LOG_BACKUP_COUNT, x_admin_tok
                 "DRY-RUN" if dry_run else "EXECUTED", len(victims), freed, keep)
     return {"dry_run": dry_run, "file_count": len(victims), "bytes": freed,
             "files": [f["name"] for f in victims]}
+
+
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     if "--init-db" in sys.argv:
