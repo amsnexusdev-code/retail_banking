@@ -9,11 +9,17 @@ Contains:
        POST /transactions                -> deposit / withdraw (updates balance)
   4. A "flaky" API: after FAIL_AFTER_SECONDS the chosen API is shut down and
      returns 503 until restarted via  POST /admin/restart/{api_name}
+     (API restart is completely independent of logs / disk space)
   5. Periodic client: calls the GET and POST APIs every CLIENT_INTERVAL_SECONDS
      so logs are generated continuously (successes AND failures).
-  6. Disk monitoring: a periodic "DISK usage=..." log line, plus admin endpoints
-       GET  /admin/disk-status     -> disk usage + rotated log versions
-       POST /admin/cleanup-logs    -> delete rotated logs beyond the newest N (dry-run by default)
+  6. Disk monitoring. Disk usage is driven ONLY by redundant log files in LOG_DIR:
+        usage = DISK_BASELINE_PERCENT + (bytes of redundant files / DISK_CAPACITY_BYTES) * 100
+     Redundant = rotated retail_bank.log.N with N > keep, or demo_<epoch>_<i>.log older than
+     DISK_CLEAN_AGE_DAYS (and other .tmp/.cache/.bak/.gz/.out names matching the same rule).
+     No redundant files -> baseline (low). New redundant files -> usage jumps immediately.
+       GET  /admin/disk-status      -> disk usage + redundant files
+       POST /admin/cleanup-logs     -> delete redundant files (dry-run by default)
+       POST /admin/create-demo-logs -> create back-dated dummy logs (demo/testing)
 
 Run:  uvicorn app:app --reload   (or: python app.py)
 """
@@ -54,7 +60,11 @@ LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "4"))  # keep 4 old version
 CLIENT_BASE_URL = os.getenv("CLIENT_BASE_URL", f"http://127.0.0.1:{PORT}")
 DISK_LOG_INTERVAL_SECONDS = int(os.getenv("DISK_LOG_INTERVAL_SECONDS", "60"))
 DISK_ALERT_PERCENT = float(os.getenv("DISK_ALERT_PERCENT", "80"))
-DISK_SIMULATE_PERCENT = float(os.getenv("DISK_SIMULATE_PERCENT", "0"))  # 0 = real value; TEST ONLY
+DISK_SIMULATE_PERCENT = float(os.getenv("DISK_SIMULATE_PERCENT", "0"))  # 0 = real model value; TEST ONLY
+# Disk model - keep these identical to the alert backend's settings
+DISK_BASELINE_PERCENT = float(os.getenv("DISK_BASELINE_PERCENT", "55"))
+DISK_CAPACITY_BYTES = int(os.getenv("DISK_CAPACITY_BYTES", "200000"))
+DISK_CLEAN_AGE_DAYS = int(os.getenv("DISK_CLEAN_AGE_DAYS", "5"))
 
 # --------------------------------------------------------------------------
 # Logging (console + rotating file)
@@ -209,9 +219,12 @@ def client_loop():
 
 
 # --------------------------------------------------------------------------
-# Disk monitoring: periodic "DISK usage=..." log line (real data for Grafana/Loki)
+# Disk monitoring - usage is derived from redundant log files only
 # --------------------------------------------------------------------------
 _LOG_NAME_RE = re.compile(r"retail_bank\.log(?:\.(\d+))?$")
+_DELETABLE_RE = re.compile(r"\.(log|tmp|cache|bak|gz|out)(\.\d+)?$", re.IGNORECASE)
+_ROTATED_RE = re.compile(r"\.log\.(\d+)$", re.IGNORECASE)
+_DEMO_RE = re.compile(r"^demo_(\d{9,11})_\d+\.log$")
 
 
 def _log_versions():
@@ -225,16 +238,47 @@ def _log_versions():
     return out
 
 
-def disk_log_once():
-    u = shutil.disk_usage(LOG_DIR)
-    pct = round(u.used / u.total * 100, 1)
+def _redundant_files(keep=LOG_BACKUP_COUNT):
+    """Files in LOG_DIR that are safe to delete: rotated logs beyond the newest `keep`,
+    and demo_<epoch>_<i>.log files older than DISK_CLEAN_AGE_DAYS. Never the live log."""
+    cutoff = time.time() - DISK_CLEAN_AGE_DAYS * 86400
+    out = []
+    for fn in os.listdir(LOG_DIR):
+        p = os.path.join(LOG_DIR, fn)
+        if not os.path.isfile(p) or os.path.islink(p) or not _DELETABLE_RE.search(fn):
+            continue
+        rot = _ROTATED_RE.search(fn)
+        demo = _DEMO_RE.match(fn)
+        if rot:
+            eligible = int(rot.group(1)) > keep
+        else:
+            eligible = bool(demo) and int(demo.group(1)) <= cutoff
+        if eligible:
+            out.append({"name": fn, "path": p, "size": os.path.getsize(p)})
+    return out
+
+
+def _disk_state(keep=LOG_BACKUP_COUNT):
+    extra = _redundant_files(keep)
+    extra_bytes = sum(f["size"] for f in extra)
+    pct = round(min(100.0, DISK_BASELINE_PERCENT + extra_bytes / max(1, DISK_CAPACITY_BYTES) * 100), 1)
     simulated = DISK_SIMULATE_PERCENT > 0
     if simulated:
         pct = DISK_SIMULATE_PERCENT
-    size = sum(f["size"] for f in _log_versions())
+    size = sum(os.path.getsize(os.path.join(LOG_DIR, fn)) for fn in os.listdir(LOG_DIR)
+               if os.path.isfile(os.path.join(LOG_DIR, fn)))
+    return {"usage_percent": pct, "extra": extra, "extra_bytes": extra_bytes,
+            "log_dir_size_bytes": size, "simulated": simulated}
+
+
+def disk_log_once(keep=LOG_BACKUP_COUNT, note=""):
+    st = _disk_state(keep)
+    pct = st["usage_percent"]
     lvl = logging.WARNING if pct >= DISK_ALERT_PERCENT else logging.INFO
-    log.log(lvl, "DISK usage=%s%% used=%s total=%s log_dir_size=%s%s",
-            pct, u.used, u.total, size, " (SIMULATED)" if simulated else "")
+    log.log(lvl, "DISK usage=%s%% extra_log_files=%s extra_bytes=%s log_dir_size=%s%s%s",
+            pct, len(st["extra"]), st["extra_bytes"], st["log_dir_size_bytes"],
+            " (SIMULATED)" if st["simulated"] else "", f" ({note})" if note else "")
+    return st
 
 
 def disk_log_loop():
@@ -324,7 +368,8 @@ def post_transaction(txn: Transaction):
 
 @app.post("/admin/restart/{api_name}")
 def restart_api(api_name: str, x_admin_token: str = Header(default="")):
-    """Restart hook used by the alert module. Protected by X-Admin-Token when ADMIN_TOKEN is set."""
+    """Restart hook used by the alert module. Protected by X-Admin-Token when ADMIN_TOKEN is set.
+    Only touches the API state - never logs or disk."""
     _check_admin(x_admin_token)
     if api_name != flaky.api_name:
         raise HTTPException(404, f"'{api_name}' is not the managed flaky API")
@@ -335,35 +380,52 @@ def restart_api(api_name: str, x_admin_token: str = Header(default="")):
 
 @app.get("/admin/disk-status")
 def disk_status(keep: int = LOG_BACKUP_COUNT, x_admin_token: str = Header(default="")):
-    """Disk usage plus rotated log versions beyond the newest `keep` ones."""
+    """Disk usage (driven by redundant log files) plus the list of those files."""
     _check_admin(x_admin_token)
-    u = shutil.disk_usage(LOG_DIR)
-    files = _log_versions()
-    extra = [f["name"] for f in files if f["version"] > keep]
-    pct = round(u.used / u.total * 100, 1)
-    size = sum(f["size"] for f in files)
-    log.info("DISK usage=%s%% used=%s total=%s log_dir_size=%s old_versions>%s=%s",
-             pct, u.used, u.total, size, keep, len(extra))
-    return {"usage_percent": pct, "used_bytes": u.used, "total_bytes": u.total,
-            "log_dir_size_bytes": size, "extra_versions": extra}
+    st = disk_log_once(keep, "disk-status")
+    return {"usage_percent": st["usage_percent"], "used_bytes": st["extra_bytes"],
+            "total_bytes": DISK_CAPACITY_BYTES, "log_dir_size_bytes": st["log_dir_size_bytes"],
+            "extra_versions": [f["name"] for f in st["extra"]], "extra_bytes": st["extra_bytes"],
+            "simulated": st["simulated"]}
 
 
 @app.post("/admin/cleanup-logs")
 def cleanup_logs(dry_run: bool = True, keep: int = LOG_BACKUP_COUNT,
                  x_admin_token: str = Header(default="")):
-    """Deletes only rotated versions retail_bank.log.N with N > keep. Never the live log.
-    Dry-run by default; pass dry_run=false to actually delete."""
+    """Deletes only redundant files (see module docstring). Never the live log.
+    Dry-run by default; pass dry_run=false to actually delete. A real run immediately
+    logs the new, lower DISK usage line."""
     _check_admin(x_admin_token)
-    victims = [f for f in _log_versions() if f["version"] > keep]
-    freed = 0
-    for f in victims:
-        freed += f["size"]
-        if not dry_run:
-            os.remove(f["path"])
+    victims = _redundant_files(keep)
+    freed = sum(f["size"] for f in victims)
+    if not dry_run:
+        for f in victims:
+            try:
+                os.remove(f["path"])
+            except OSError as e:
+                log.error("DISK cleanup could not delete %s: %s", f["name"], e)
     log.warning("DISK log cleanup %s: %s file(s), %s bytes (keep newest %s versions)",
                 "DRY-RUN" if dry_run else "EXECUTED", len(victims), freed, keep)
+    after = disk_log_once(keep, "after cleanup") if not dry_run else _disk_state(keep)
     return {"dry_run": dry_run, "file_count": len(victims), "bytes": freed,
-            "files": [f["name"] for f in victims]}
+            "files": [f["name"] for f in victims], "usage_after_percent": after["usage_percent"]}
+
+
+@app.post("/admin/create-demo-logs")
+def create_demo_logs(count: int = 5, epoch: int = 0, x_admin_token: str = Header(default="")):
+    """Demo helper: creates back-dated dummy logs demo_<epoch>_<i>.log (10 KB each) so they count
+    as redundant. A fresh DISK usage line is logged immediately (usage jumps right away)."""
+    _check_admin(x_admin_token)
+    ts = epoch or int(time.time() - (DISK_CLEAN_AGE_DAYS + 1) * 86400)
+    made = []
+    for i in range(max(1, min(count, 20))):
+        name = f"demo_{ts}_{i}.log"
+        with open(os.path.join(LOG_DIR, name), "wb") as f:
+            f.write(b"x" * 10_000)
+        made.append(name)
+    log.warning("DISK created %s redundant demo log file(s)", len(made))
+    st = disk_log_once(note="after new files")
+    return {"created": made, "usage_percent": st["usage_percent"]}
 
 
 # --------------------------------------------------------------------------
