@@ -1,0 +1,82 @@
+2026-10-20 13:08:12,114 | WARNING | retail_bank.transactions | Insufficient funds txn_id=TXN75303745 account=XXXXXX9798 requested=120.44 INR
+2026-10-20 13:08:13,140 | INFO    | retail_bank.auth | Login success customer_id=C265779 channel=web mfa=otp
+2026-10-20 13:08:16,713 | INFO    | retail_bank.http | GET /accounts/XXXXXX8640 200 60ms req-477dd7
+2026-10-20 13:08:19,878 | WARNING | retail_bank.transactions | Insufficient funds txn_id=TXN38296462 account=XXXXXX8854 requested=25.30 INR
+2026-10-20 13:08:23,311 | INFO    | retail_bank.transactions | Withdrawal posted txn_id=TXN35902834 account=XXXXXX6319 amount=40.17 INR status=COMPLETED
+2026-10-20 13:08:24,880 | INFO    | retail_bank.auth | Login success customer_id=C705202 channel=mobile mfa=otp
+2026-10-20 13:08:27,205 | INFO    | retail_bank.http | GET /accounts/XXXXXX9989/balance 200 25ms req-cfdbc0
+2026-10-20 13:08:29,422 | WARNING | retail_bank.auth | Failed login attempt customer_id=C264954 reason=INVALID_CREDENTIALS attempt=2
+2026-10-20 13:08:32,384 | INFO    | retail_bank.auth | Login success customer_id=C323814 channel=mobile mfa=otp
+2026-10-20 13:08:34,252 | INFO    | retail_bank.transactions | Deposit posted txn_id=TXN77282225 account=XXXXXX9447 amount=500.63 INR status=COMPLETED
+2026-10-20 13:08:37,155 | INFO    | retail_bank.http | POST /transactions 201 134ms req-8e8afb
+2026-10-20 13:08:39,210 | INFO    | retail_bank.http | GET /accounts/XXXXXX9084 200 51ms req-c846da
+2026-10-20 13:08:40,876 | INFO    | retail_bank.http | GET /accounts/XXXXXX3787 200 43ms req-bfae8a
+2026-10-20 13:08:43,677 | INFO    | retail_bank.auth | Login success customer_id=C446016 channel=mobile mfa=otp
+2026-10-20 13:08:46,404 | INFO    | retail_bank.transfers | Fund transfer settled txn_id=TXN71970889 settlement_ms=419
+2026-10-20 13:08:49,017 | WARNING | retail_bank.http | GET /accounts/XXXXXX4989 404 15ms account not found req-fa4444
+2026-10-20 13:08:52,055 | INFO    | retail_bank.http | GET /accounts/XXXXXX9742/balance 200 37ms req-abf816
+2026-10-20 13:08:53,490 | INFO    | retail_bank.http | POST /transactions 201 128ms req-a439a2
+2026-10-20 13:08:55,721 | WARNING | retail_bank.auth | Failed login attempt customer_id=C505848 reason=INVALID_CREDENTIALS attempt=3
+2026-10-20 13:08:56,234 | INFO    | retail_bank.batch | EOD interest accrual batch processed accounts=3602 elapsed=28s
+2026-10-20 13:08:58,962 | WARNING | retail_bank.auth | Failed login attempt customer_id=C228016 reason=INVALID_CREDENTIALS attempt=2
+2026-10-20 13:09:01,212 | INFO    | retail_bank.transfers | Fund transfer initiated txn_id=TXN56089942 from=XXXXXX8000 to=XXXXXX1323 amount=120.53 INR mode=UPI
+2026-10-20 13:09:02,447 | INFO    | retail_bank.auth | Login success customer_id=C409239 channel=web mfa=otp
+2026-10-20 13:09:03,512 | WARNING | retail_bank.transactions | Insufficient funds txn_id=TXN85793865 account=XXXXXX2047 requested=1200.75 INR
+2026-10-20 13:09:06,299 | INFO    | retail_bank.transfers | Fund transfer settled txn_id=TXN47951272 settlement_ms=771
+2026-10-20 13:09:07,868 | WARNING | retail_bank.db | Slow query table=transactions elapsed=1052ms threshold=500ms
+2026-10-20 13:09:11,809 | INFO    | retail_bank.http | GET /accounts/XXXXXX6602 200 42ms req-2fd1a9
+2026-10-20 13:09:15,052 | INFO    | retail_bank.transactions | Deposit posted txn_id=TXN94662456 account=XXXXXX2821 amount=500.01 INR status=COMPLETED
+2026-10-20 13:09:16,527 | INFO    | retail_bank.http | GET /accounts/XXXXXX4992 200 53ms req-d7f82a
+2026-10-20 13:09:19,583 | INFO    | retail_bank.http | GET /accounts/XXXXXX7811 200 24ms req-43e291
+2026-10-20 13:09:21,561 | INFO    | retail_bank.transactions | Withdrawal posted txn_id=TXN18050595 account=XXXXXX7943 amount=25.50 INR status=COMPLETED
+2026-10-20 13:09:22,405 | INFO    | retail_bank.http | GET /accounts/XXXXXX3957 200 25ms req-13ab3a
+2026-10-20 13:09:23,420 | WARNING | retail_bank.auth | Failed login attempt customer_id=C530024 reason=INVALID_CREDENTIALS attempt=3
+2026-10-20 13:09:26,119 | INFO    | retail_bank.transactions | Deposit posted txn_id=TXN61084068 account=XXXXXX8638 amount=250.28 INR status=COMPLETED
+2026-10-20 13:09:26,779 | WARNING | retail_bank.transactions | Insufficient funds txn_id=TXN94600932 account=XXXXXX7746 requested=1200.83 INR
+2026-10-20 13:09:29,033 | INFO    | retail_bank.http | GET /accounts/XXXXXX8619/balance 200 15ms req-836db8
+2026-10-20 13:09:29,522 | INFO    | retail_bank.audit | Audit event=ACCOUNT_VIEW customer_id=C243384 ip=10.0.100.136
+2026-10-20 13:09:30,768 | INFO    | retail_bank.transfers | Fund transfer settled txn_id=TXN62231815 settlement_ms=306
+2026-10-20 13:09:33,352 | INFO    | retail_bank.http | POST /transactions 201 85ms req-a7fc26
+2026-10-20 13:09:36,437 | INFO    | retail_bank.transfers | Fund transfer settled txn_id=TXN99152592 settlement_ms=163
+2026-10-20 13:09:37,114 | ERROR   | retail_bank.cards | Card authorization declined card=****1155 code=05 reason=DO_NOT_HONOR
+2026-10-20 13:09:39,758 | INFO    | retail_bank.transactions | Deposit posted txn_id=TXN31877040 account=XXXXXX1206 amount=500.88 INR status=COMPLETED
+2026-10-20 13:09:42,286 | WARNING | retail_bank.risk | Fraud rule velocity_check flagged txn_id=TXN64317683 account=XXXXXX4062 score=84 action=REVIEW
+2026-10-20 13:09:45,738 | WARNING | retail_bank.transactions | Insufficient funds txn_id=TXN35842621 account=XXXXXX6928 requested=250.30 INR
+2026-10-20 13:09:47,752 | INFO    | retail_bank.db | Query ok table=accounts rows=1 elapsed=17ms pool_in_use=3/20
+2026-10-20 13:09:49,523 | WARNING | retail_bank.auth | Failed login attempt customer_id=C298040 reason=INVALID_CREDENTIALS attempt=3
+2026-10-20 13:09:52,715 | INFO    | retail_bank.transfers | Fund transfer settled txn_id=TXN91665602 settlement_ms=852
+2026-10-20 13:09:53,275 | INFO    | retail_bank.http | GET /accounts/XXXXXX7688 200 29ms req-6f6cad
+2026-10-20 13:09:57,002 | INFO    | retail_bank.http | GET /accounts/XXXXXX4132 200 55ms req-fe0357
+2026-10-20 13:09:57,612 | INFO    | retail_bank.transactions | Withdrawal posted txn_id=TXN71472269 account=XXXXXX7925 amount=2500.37 INR status=COMPLETED
+2026-10-20 13:09:58,851 | INFO    | retail_bank.cards | Card authorization approved card=****5443 merchant_category=5812 amount=2500.66 INR
+2026-10-20 13:10:00,223 | WARNING | retail_bank.risk | Fraud rule velocity_check flagged txn_id=TXN45659487 account=XXXXXX8784 score=76 action=REVIEW
+2026-10-20 13:10:01,835 | INFO    | retail_bank.auth | Login success customer_id=C198188 channel=web mfa=otp
+2026-10-20 13:10:01,910 | INFO    | retail_bank.transactions | Withdrawal posted txn_id=TXN33815552 account=XXXXXX1763 amount=120.01 INR status=COMPLETED
+2026-10-20 13:10:04,060 | INFO    | retail_bank.transfers | Fund transfer settled txn_id=TXN60419238 settlement_ms=507
+2026-10-20 13:10:07,980 | INFO    | retail_bank.transfers | Fund transfer settled txn_id=TXN46750653 settlement_ms=552
+2026-10-20 13:10:11,841 | INFO    | retail_bank.audit | Audit event=ACCOUNT_VIEW customer_id=C850213 ip=10.0.255.58
+2026-10-20 13:10:13,172 | INFO    | retail_bank.batch | EOD interest accrual batch processed accounts=2593 elapsed=13s
+2026-10-20 13:10:14,547 | INFO    | retail_bank.http | POST /transactions 201 145ms req-e597fc
+2026-10-20 13:10:16,077 | WARNING | retail_bank.risk | Fraud rule velocity_check flagged txn_id=TXN71643482 account=XXXXXX3493 score=79 action=REVIEW
+2026-10-20 13:10:18,737 | INFO    | retail_bank.http | GET /accounts/XXXXXX2941 200 40ms req-5a21c3
+2026-10-20 13:10:22,246 | INFO    | retail_bank.auth | Login success customer_id=C328571 channel=web mfa=otp
+2026-10-20 13:10:24,319 | INFO    | retail_bank.http | POST /transactions 201 68ms req-8cbe17
+2026-10-20 13:10:28,086 | INFO    | retail_bank.db | Query ok table=accounts rows=1 elapsed=16ms pool_in_use=6/20
+2026-10-20 13:10:29,990 | WARNING | retail_bank.auth | Failed login attempt customer_id=C143237 reason=INVALID_CREDENTIALS attempt=3
+2026-10-20 13:10:30,448 | INFO    | retail_bank.transactions | Deposit posted txn_id=TXN51329644 account=XXXXXX9430 amount=2500.48 INR status=COMPLETED
+2026-10-20 13:10:33,102 | INFO    | retail_bank.http | POST /transactions 201 162ms req-f607a4
+2026-10-20 13:10:33,225 | INFO    | retail_bank.http | POST /transactions 201 58ms req-953b01
+2026-10-20 13:10:36,965 | WARNING | retail_bank.risk | Fraud rule velocity_check flagged txn_id=TXN64013705 account=XXXXXX5153 score=78 action=REVIEW
+2026-10-20 13:10:40,325 | WARNING | retail_bank.db | Slow query table=transactions elapsed=2397ms threshold=500ms
+2026-10-20 13:10:44,067 | WARNING | retail_bank.transactions | Insufficient funds txn_id=TXN15347342 account=XXXXXX7004 requested=120.61 INR
+2026-10-20 13:10:45,099 | INFO    | retail_bank.transfers | Fund transfer initiated txn_id=TXN86567523 from=XXXXXX6314 to=XXXXXX3837 amount=2500.89 INR mode=NEFT
+2026-10-20 13:10:46,663 | INFO    | retail_bank.http | GET /accounts/XXXXXX7491/balance 200 29ms req-3475fd
+2026-10-20 13:10:48,471 | INFO    | retail_bank.http | GET /accounts/XXXXXX9746/balance 200 44ms req-7c0455
+2026-10-20 13:10:51,255 | WARNING | retail_bank.risk | Fraud rule velocity_check flagged txn_id=TXN63720287 account=XXXXXX8029 score=69 action=REVIEW
+2026-10-20 13:10:54,612 | INFO    | retail_bank.http | GET /accounts/XXXXXX4214/balance 200 7ms req-f12a0d
+2026-10-20 13:10:55,048 | INFO    | retail_bank.http | GET /accounts/XXXXXX8877 200 48ms req-d39301
+2026-10-20 13:10:58,183 | INFO    | retail_bank.http | POST /transactions 201 161ms req-3abf85
+2026-10-20 13:11:00,737 | INFO    | retail_bank.db | Query ok table=accounts rows=1 elapsed=13ms pool_in_use=4/20
+2026-10-20 13:11:04,613 | WARNING | retail_bank.http | GET /accounts/XXXXXX4399 404 9ms account not found req-ecd0e0
+2026-10-20 13:11:07,855 | WARNING | retail_bank.http | GET /accounts/XXXXXX4762 404 10ms account not found req-e95cde
+2026-10-20 13:11:10,335 | INFO    | retail_bank.transactions | Withdrawal posted txn_id=TXN99776987 account=XXXXXX2454 amount=250.62 INR status=COMPLETED
