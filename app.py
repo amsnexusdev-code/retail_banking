@@ -13,10 +13,14 @@ Contains:
   5. Periodic client: calls the GET and POST APIs every CLIENT_INTERVAL_SECONDS
      so logs are generated continuously (successes AND failures).
   6. Disk monitoring. Disk usage is driven ONLY by redundant log files in LOG_DIR:
-        usage = DISK_BASELINE_PERCENT + (bytes of redundant files / DISK_CAPACITY_BYTES) * 100
+        usage = BASELINE + (bytes of redundant files / DISK_CAPACITY_BYTES) * 100
+     BASELINE starts at DISK_BASELINE_PERCENT (55) and, after every real cleanup that deletes
+     files, becomes a new random value between DISK_AFTER_CLEANUP_MIN_PERCENT and
+     DISK_AFTER_CLEANUP_MAX_PERCENT (default 50-55). It is saved to DISK_STATE_FILE so it
+     survives restarts.
      Redundant = rotated retail_bank.log.N with N > keep, or demo_<epoch>_<i>.log older than
      DISK_CLEAN_AGE_DAYS (and other .tmp/.cache/.bak/.gz/.out names matching the same rule).
-     No redundant files -> baseline (low). New redundant files -> usage jumps immediately.
+     No redundant files -> baseline. New redundant files -> usage jumps immediately.
        GET  /admin/disk-status      -> disk usage + redundant files
        POST /admin/cleanup-logs     -> delete redundant files (dry-run by default)
        POST /admin/create-demo-logs -> create back-dated dummy logs (demo/testing)
@@ -65,6 +69,10 @@ DISK_SIMULATE_PERCENT = float(os.getenv("DISK_SIMULATE_PERCENT", "0"))  # 0 = re
 DISK_BASELINE_PERCENT = float(os.getenv("DISK_BASELINE_PERCENT", "55"))
 DISK_CAPACITY_BYTES = int(os.getenv("DISK_CAPACITY_BYTES", "200000"))
 DISK_CLEAN_AGE_DAYS = int(os.getenv("DISK_CLEAN_AGE_DAYS", "5"))
+# After a real cleanup the baseline usage becomes a random value in this range (new one every cleanup)
+DISK_AFTER_CLEANUP_MIN_PERCENT = float(os.getenv("DISK_AFTER_CLEANUP_MIN_PERCENT", "50"))
+DISK_AFTER_CLEANUP_MAX_PERCENT = float(os.getenv("DISK_AFTER_CLEANUP_MAX_PERCENT", "55"))
+DISK_STATE_FILE = os.getenv("DISK_STATE_FILE", ".disk_baseline")   # keeps the baseline across restarts
 
 # --------------------------------------------------------------------------
 # Logging (console + rotating file)
@@ -226,6 +234,42 @@ _DELETABLE_RE = re.compile(r"\.(log|tmp|cache|bak|gz|out)(\.\d+)?$", re.IGNORECA
 _ROTATED_RE = re.compile(r"\.log\.(\d+)$", re.IGNORECASE)
 _DEMO_RE = re.compile(r"^demo_(\d{9,11})_\d+\.log$")
 
+# Baseline usage (the figure when no redundant files exist). Starts at DISK_BASELINE_PERCENT and is
+# re-rolled to a random value in [DISK_AFTER_CLEANUP_MIN_PERCENT, DISK_AFTER_CLEANUP_MAX_PERCENT]
+# after every real cleanup that deletes files. Saved to DISK_STATE_FILE so a restart keeps it.
+_baseline_pct = DISK_BASELINE_PERCENT
+_baseline_lock = threading.Lock()
+
+
+def _load_baseline():
+    global _baseline_pct
+    try:
+        with open(DISK_STATE_FILE, "r", encoding="utf-8") as fh:
+            v = float(fh.read().strip())
+        if 0 <= v <= 100:
+            _baseline_pct = v
+            log.info("DISK baseline restored from %s: %s%%", DISK_STATE_FILE, v)
+    except (OSError, ValueError):
+        pass   # no saved value yet -> keep DISK_BASELINE_PERCENT
+
+
+def _roll_baseline():
+    """New random baseline after a cleanup; persisted best-effort."""
+    global _baseline_pct
+    lo, hi = sorted((DISK_AFTER_CLEANUP_MIN_PERCENT, DISK_AFTER_CLEANUP_MAX_PERCENT))
+    with _baseline_lock:
+        _baseline_pct = round(random.uniform(lo, hi), 1)
+        value = _baseline_pct
+    try:
+        with open(DISK_STATE_FILE, "w", encoding="utf-8") as fh:
+            fh.write(str(value))
+    except OSError as e:
+        log.error("DISK baseline could not be saved to %s: %s", DISK_STATE_FILE, e)
+    return value
+
+
+_load_baseline()
+
 
 def _log_versions():
     """retail_bank.log (version 0) and rotated retail_bank.log.N files with their sizes."""
@@ -261,7 +305,7 @@ def _redundant_files(keep=LOG_BACKUP_COUNT):
 def _disk_state(keep=LOG_BACKUP_COUNT):
     extra = _redundant_files(keep)
     extra_bytes = sum(f["size"] for f in extra)
-    pct = round(min(100.0, DISK_BASELINE_PERCENT + extra_bytes / max(1, DISK_CAPACITY_BYTES) * 100), 1)
+    pct = round(min(100.0, _baseline_pct + extra_bytes / max(1, DISK_CAPACITY_BYTES) * 100), 1)
     simulated = DISK_SIMULATE_PERCENT > 0
     if simulated:
         pct = DISK_SIMULATE_PERCENT
@@ -393,19 +437,25 @@ def disk_status(keep: int = LOG_BACKUP_COUNT, x_admin_token: str = Header(defaul
 def cleanup_logs(dry_run: bool = True, keep: int = LOG_BACKUP_COUNT,
                  x_admin_token: str = Header(default="")):
     """Deletes only redundant files (see module docstring). Never the live log.
-    Dry-run by default; pass dry_run=false to actually delete. A real run immediately
-    logs the new, lower DISK usage line."""
+    Dry-run by default; pass dry_run=false to actually delete. A real run that deletes files
+    sets a new random baseline usage (DISK_AFTER_CLEANUP_MIN/MAX_PERCENT, default 50-55%) and
+    immediately logs the new, lower DISK usage line."""
     _check_admin(x_admin_token)
     victims = _redundant_files(keep)
     freed = sum(f["size"] for f in victims)
+    deleted = 0
     if not dry_run:
         for f in victims:
             try:
                 os.remove(f["path"])
+                deleted += 1
             except OSError as e:
                 log.error("DISK cleanup could not delete %s: %s", f["name"], e)
     log.warning("DISK log cleanup %s: %s file(s), %s bytes (keep newest %s versions)",
                 "DRY-RUN" if dry_run else "EXECUTED", len(victims), freed, keep)
+    if not dry_run and deleted:
+        new_base = _roll_baseline()
+        log.warning("DISK baseline after cleanup set to %s%%", new_base)
     after = disk_log_once(keep, "after cleanup") if not dry_run else _disk_state(keep)
     return {"dry_run": dry_run, "file_count": len(victims), "bytes": freed,
             "files": [f["name"] for f in victims], "usage_after_percent": after["usage_percent"]}
