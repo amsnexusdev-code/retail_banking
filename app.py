@@ -30,6 +30,10 @@ Contains:
      validated column by column. On the first formatting problem the job is PAUSED, the exact
      record / column / value / issue is logged ("BATCH PROCESSING FAILURE ...") and published in
      the batch block of GET /health; nothing already processed is touched.
+     TXT-stage defect: the database values are clean. While a record is being written to the TXT
+     line, BATCH_TXT_ERROR_ROWS_PER_JOB random record(s) per job get a stray '@' appended into the holder
+     name (a formatting defect of the TXT stage). The check catches it, the job pauses and the failure
+     says the database value itself is fine. The database is only READ; set the variable to 0 to turn it off.
      After a person approves "Skip & Resume" (POST /admin/restart/batch_processing, the existing
      restart hook) the failing record is skipped and processing continues from the next record in
      a NEW file (batch_001.txt -> batch_002.txt -> ...). Files are never appended to after a failure.
@@ -101,6 +105,8 @@ BATCH_START_DELAY_SECONDS = int(os.getenv("BATCH_START_DELAY_SECONDS", "20"))  #
 BATCH_LEASE_SECONDS = int(os.getenv("BATCH_LEASE_SECONDS", "120"))            # job lease (renewed per record)
 BATCH_RECORD_DELAY_SECONDS = float(os.getenv("BATCH_RECORD_DELAY_SECONDS", "0"))  # optional slow-down for demos
 BATCH_DOWNLOAD_MAX_BYTES = int(os.getenv("BATCH_DOWNLOAD_MAX_BYTES", "3000000"))  # raw bytes of files published for auto-download
+BATCH_TXT_ERROR_ROWS_PER_JOB = int(os.getenv("BATCH_TXT_ERROR_ROWS_PER_JOB", "1"))  # TXT-stage formatting defects per job; 0 = off
+BATCH_TXT_BAD_CHAR = "@"
 BATCH_COMPONENT = "batch_processing"   # name accepted by POST /admin/restart/{api_name} (= Skip & Resume)
 
 # --------------------------------------------------------------------------
@@ -653,6 +659,24 @@ def _validate_batch_record(row, job_id, record_no):
     return line, None
 
 
+def _txt_defect_records(job):
+    """Record numbers (1-based, in id order) that get the TXT-stage formatting defect in this job.
+    Deterministic per job (seeded with the job id), so a restart continues with the same records."""
+    k = max(0, BATCH_TXT_ERROR_ROWS_PER_JOB)
+    if not k:
+        return set()
+    n = _i(sql("SELECT COUNT(*) AS n FROM accounts WHERE id > $1::int", [str(_i(job["start_account_id"]))])[0]["n"])
+    return set(random.Random(_i(job["job_id"])).sample(range(1, n + 1), min(k, n))) if n else set()
+
+
+def _apply_txt_defect(row):
+    """Simulates the formatting defect of the TXT stage: a stray character lands inside the holder name
+    of the line being written. Returns (row_as_rendered, original_name). The database row is untouched."""
+    original = str(row.get("holder_name") or "Unknown")
+    mid = max(1, len(original) // 2)
+    return {**row, "holder_name": f"{original[:mid]}{BATCH_TXT_BAD_CHAR}{original[mid:]}"}, original
+
+
 def _batch_txt_bytes(lines):
     """Notepad-compatible content: header + lines, CRLF endings, ASCII (valid UTF-8 as well)."""
     return ("\r\n".join([BATCH_HEADER_LINE, *lines]) + "\r\n").encode("ascii")
@@ -812,6 +836,11 @@ def _process_batch_job(job_id, owner):
     job = rows[0]
     last_id, rec_no = _i(job["last_account_id"]), _i(job["last_record_no"])
     file_no, file_lines = _i(job["next_file_no"]), _i(job["file_line_count"])
+    try:
+        defect_at = _txt_defect_records(job)
+    except Exception as e:
+        defect_at = set()
+        log.error("BATCH job %s: TXT defect plan could not be read (%s); continuing without it", job_id, e)
     log.info("BATCH job %s processing from record %s into %s", job_id, rec_no + 1, _batch_file_name(file_no))
     _refresh_batch_snapshot()
 
@@ -822,7 +851,13 @@ def _process_batch_job(job_id, owner):
         row = fetched[0]
         rec_no += 1
         db_id = _i(row["id"])
+        original_name = None
+        if rec_no in defect_at:                       # TXT-stage defect: a stray character is added while writing
+            row, original_name = _apply_txt_defect(row)
         line, failure = _validate_batch_record(row, job_id, rec_no)
+        if failure and original_name is not None:
+            failure["issue"] += (f" | database value {_show(original_name)} is correct; the character was added "
+                                 f"while the record was being written to the TXT file")
         if failure:
             closed = _batch_file_name(file_no) if file_lines > 0 else None
             nxt = _batch_file_name(file_no + (1 if file_lines > 0 else 0))
