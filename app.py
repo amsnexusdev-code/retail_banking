@@ -30,6 +30,8 @@ Contains:
      validated column by column. On the first formatting problem the job is PAUSED, the exact
      record / column / value / issue is logged ("BATCH PROCESSING FAILURE ...") and published in
      the batch block of GET /health; nothing already processed is touched.
+     Every run reads ALL account rows again (BATCH_REPROCESS_ALL=true, default): no new account is needed
+     to get a new job. Set it to false to process only accounts added since the last completed job.
      TXT-stage defect: the database values are clean. While a record is being written to the TXT
      line, BATCH_TXT_ERROR_ROWS_PER_JOB random record(s) per job get a stray '@' appended into the holder
      name (a formatting defect of the TXT stage). The check catches it, the job pauses and the failure
@@ -105,6 +107,7 @@ BATCH_START_DELAY_SECONDS = int(os.getenv("BATCH_START_DELAY_SECONDS", "20"))  #
 BATCH_LEASE_SECONDS = int(os.getenv("BATCH_LEASE_SECONDS", "120"))            # job lease (renewed per record)
 BATCH_RECORD_DELAY_SECONDS = float(os.getenv("BATCH_RECORD_DELAY_SECONDS", "0"))  # optional slow-down for demos
 BATCH_DOWNLOAD_MAX_BYTES = int(os.getenv("BATCH_DOWNLOAD_MAX_BYTES", "3000000"))  # raw bytes of files published for auto-download
+BATCH_REPROCESS_ALL = os.getenv("BATCH_REPROCESS_ALL", "true").lower() == "true"   # every job reads ALL account rows (true) or only rows added since the last completed job (false)
 BATCH_TXT_ERROR_ROWS_PER_JOB = int(os.getenv("BATCH_TXT_ERROR_ROWS_PER_JOB", "1"))  # TXT-stage formatting defects per job; 0 = off
 BATCH_TXT_BAD_CHAR = "@"
 BATCH_COMPONENT = "batch_processing"   # name accepted by POST /admin/restart/{api_name} (= Skip & Resume)
@@ -463,12 +466,16 @@ SELECT id, account_number, holder_name, balance::text AS balance, status, last_t
 FROM accounts WHERE id > $1::int ORDER BY id LIMIT 1
 """
 
-# new job: starts after the last account of the newest COMPLETED job, only if there is something new.
-# The unique "one active job" index turns a concurrent insert into a no-op.
-BATCH_NEW_JOB_SQL = """
+# new job. BATCH_REPROCESS_ALL=true (default): every job starts at the first account, so the same rows are
+# processed again on every run. false: the job starts after the last account of the newest COMPLETED job and only
+# exists when there is something new. Either way the unique "one active job" index turns a concurrent insert
+# into a no-op.
+_BATCH_NEW_JOB_START = ("SELECT 0 AS m" if BATCH_REPROCESS_ALL else
+                        "SELECT COALESCE(MAX(last_account_id), 0) AS m FROM batch_jobs WHERE status = 'COMPLETED'")
+BATCH_NEW_JOB_SQL = f"""
 INSERT INTO batch_jobs (status, start_account_id, last_account_id, owner, lease_until)
 SELECT 'RUNNING', s.m, s.m, $1::text, now() + make_interval(secs => $2::int)
-FROM (SELECT COALESCE(MAX(last_account_id), 0) AS m FROM batch_jobs WHERE status = 'COMPLETED') s
+FROM ({_BATCH_NEW_JOB_START}) s
 WHERE EXISTS (SELECT 1 FROM accounts WHERE id > s.m)
 ON CONFLICT DO NOTHING
 RETURNING job_id
@@ -929,7 +936,8 @@ def _batch_tick():
             return
         created = sql(BATCH_NEW_JOB_SQL, [owner, str(BATCH_LEASE_SECONDS)])
         if not created:
-            log.info("BATCH nothing to process: no account records after the last completed job")
+            log.info("BATCH nothing to process: no account records found" if BATCH_REPROCESS_ALL else
+                     "BATCH nothing to process: no account records after the last completed job")
             return
         _process_batch_job(_i(created[0]["job_id"]), owner)
     except Exception as e:
