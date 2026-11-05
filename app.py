@@ -24,9 +24,26 @@ Contains:
        GET  /admin/disk-status      -> disk usage + redundant files
        POST /admin/cleanup-logs     -> delete redundant files (dry-run by default)
        POST /admin/create-demo-logs -> create back-dated dummy logs (demo/testing)
+  7. Scheduled batch processing (accounts table -> Notepad-compatible TXT files).
+     A scheduler thread (every BATCH_INTERVAL_SECONDS) fetches the accounts one record at a time
+     (ordered by id) and renders each as a pipe-delimited ASCII/CRLF line. The rendered line is
+     validated column by column. On the first formatting problem the job is PAUSED, the exact
+     record / column / value / issue is logged ("BATCH PROCESSING FAILURE ...") and published in
+     the batch block of GET /health; nothing already processed is touched.
+     After a person approves "Skip & Resume" (POST /admin/restart/batch_processing, the existing
+     restart hook) the failing record is skipped and processing continues from the next record in
+     a NEW file (batch_001.txt -> batch_002.txt -> ...). Files are never appended to after a failure.
+     Progress (checkpoint, lines, skipped records) lives in the Neon database only:
+       batch_jobs / batch_lines / batch_skipped. No generated file is ever written to the server
+     filesystem. Overlapping runs are prevented by an in-process lock, a DB lease and a unique
+     "one active job" index. When a job completes, the final Excel workbook (processed + skipped
+     worksheets) is built in memory (build_batch_workbook) - see the note on downloads there.
 
 Run:  uvicorn app:app --reload   (or: python app.py)
 """
+import base64
+import io
+import json
 import logging
 import os
 import random
@@ -35,7 +52,11 @@ import shutil
 import sys
 import threading
 import time
+import unicodedata
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse
 
@@ -73,6 +94,14 @@ DISK_CLEAN_AGE_DAYS = int(os.getenv("DISK_CLEAN_AGE_DAYS", "5"))
 DISK_AFTER_CLEANUP_MIN_PERCENT = float(os.getenv("DISK_AFTER_CLEANUP_MIN_PERCENT", "50"))
 DISK_AFTER_CLEANUP_MAX_PERCENT = float(os.getenv("DISK_AFTER_CLEANUP_MAX_PERCENT", "55"))
 DISK_STATE_FILE = os.getenv("DISK_STATE_FILE", ".disk_baseline")   # keeps the baseline across restarts
+# Scheduled batch processing (accounts -> TXT files)
+BATCH_ENABLED = os.getenv("BATCH_ENABLED", "true").lower() == "true"
+BATCH_INTERVAL_SECONDS = int(os.getenv("BATCH_INTERVAL_SECONDS", "300"))      # scheduler period
+BATCH_START_DELAY_SECONDS = int(os.getenv("BATCH_START_DELAY_SECONDS", "20"))  # first run after startup
+BATCH_LEASE_SECONDS = int(os.getenv("BATCH_LEASE_SECONDS", "120"))            # job lease (renewed per record)
+BATCH_RECORD_DELAY_SECONDS = float(os.getenv("BATCH_RECORD_DELAY_SECONDS", "0"))  # optional slow-down for demos
+BATCH_DOWNLOAD_MAX_BYTES = int(os.getenv("BATCH_DOWNLOAD_MAX_BYTES", "3000000"))  # raw bytes of files published for auto-download
+BATCH_COMPONENT = "batch_processing"   # name accepted by POST /admin/restart/{api_name} (= Skip & Resume)
 
 # --------------------------------------------------------------------------
 # Logging (console + rotating file)
@@ -129,6 +158,55 @@ CREATE TABLE IF NOT EXISTS accounts (
 )
 """
 
+# Batch-processing tables (one statement per entry - Neon HTTP runs one statement per call)
+BATCH_DDL = [
+    """
+    CREATE TABLE IF NOT EXISTS batch_jobs (
+        job_id           SERIAL PRIMARY KEY,
+        status           VARCHAR(12) NOT NULL,          -- RUNNING | PAUSED | COMPLETED
+        start_account_id INT NOT NULL DEFAULT 0,
+        last_account_id  INT NOT NULL DEFAULT 0,        -- checkpoint: last accounts.id fully handled
+        last_record_no   INT NOT NULL DEFAULT 0,        -- sequence number of the last handled record
+        processed_count  INT NOT NULL DEFAULT 0,
+        skipped_count    INT NOT NULL DEFAULT 0,
+        next_file_no     INT NOT NULL DEFAULT 1,        -- file the next processed record goes into
+        file_line_count  INT NOT NULL DEFAULT 0,        -- records already in that file
+        failure          JSONB,                         -- details of the record the job is paused on
+        owner            VARCHAR(40),                   -- lease owner (fencing token)
+        lease_until      TIMESTAMPTZ,
+        started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        finished_at      TIMESTAMPTZ
+    )
+    """,
+    # at most ONE active (RUNNING or PAUSED) job at any time -> overlapping jobs are impossible
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_batch_one_active ON batch_jobs ((1)) WHERE status IN ('RUNNING','PAUSED')",
+    """
+    CREATE TABLE IF NOT EXISTS batch_lines (
+        job_id     INT NOT NULL,
+        record_no  INT NOT NULL,
+        file_no    INT NOT NULL,
+        account_id INT NOT NULL,
+        line       TEXT NOT NULL,
+        PRIMARY KEY (job_id, record_no)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS batch_skipped (
+        job_id         INT NOT NULL,
+        record_no      INT NOT NULL,
+        account_id     INT NOT NULL,
+        account_number TEXT,
+        column_name    TEXT,
+        value_shown    TEXT,
+        issue          TEXT,
+        failed_at      TIMESTAMPTZ,
+        skipped_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (job_id, record_no)
+    )
+    """,
+]
+
 SEED_ACCOUNTS = [
     ("ACC1001", "Aarav Sharma", 25000),
     ("ACC1002", "Priya Das", 48000),
@@ -151,7 +229,9 @@ def init_db():
         + " ON CONFLICT (account_number) DO NOTHING",
         params,
     )
-    log.info("DB ready (via Neon HTTP): table 'accounts' exists and seed data present")
+    for stmt in BATCH_DDL:
+        sql(stmt)
+    log.info("DB ready (via Neon HTTP): table 'accounts' exists and seed data present; batch tables ready")
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +421,527 @@ def _check_admin(token: str):
 
 
 # --------------------------------------------------------------------------
+# Scheduled batch processing: accounts -> Notepad-compatible TXT files
+# --------------------------------------------------------------------------
+# TXT layout (predefined): ASCII, CRLF line endings, "|" delimiter, one header line per file, one
+# line per account. Every column has a fixed specification; the rendered text of each column is
+# checked against it BEFORE the line is accepted.
+BATCH_DELIM = "|"
+# (db column, header, nullable, max length, allowed characters, full pattern, human description)
+BATCH_COLUMNS = [
+    ("account_number", "ACCOUNT_NUMBER", False, 20, r"[A-Z0-9]", r"[A-Z0-9]{1,20}",
+     "1-20 uppercase letters/digits"),
+    ("holder_name", "HOLDER_NAME", False, 100, r"[A-Za-z .'\-]", r"[A-Za-z][A-Za-z .'\-]*",
+     "letters, space, '.', apostrophe, '-' (must start with a letter)"),
+    ("balance", "BALANCE", False, 15, r"[0-9.]", r"\d{1,12}\.\d{2}",
+     "amount with exactly 2 decimals, e.g. 25000.00"),
+    ("status", "STATUS", False, 10, r"[A-Z]", r"[A-Z]{1,10}", "1-10 uppercase letters"),
+    ("last_txn_type", "LAST_TXN_TYPE", True, 10, r"[a-z]", r"deposit|withdraw",
+     "'deposit' or 'withdraw' (or empty)"),
+    ("last_txn_amount", "LAST_TXN_AMOUNT", True, 15, r"[0-9.]", r"\d{1,12}\.\d{2}",
+     "amount with exactly 2 decimals (or empty)"),
+    ("created_at", "CREATED_AT", False, 20, r"[0-9T:\-Z]", r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+     "UTC timestamp YYYY-MM-DDTHH:MM:SSZ"),
+    ("updated_at", "UPDATED_AT", False, 20, r"[0-9T:\-Z]", r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+     "UTC timestamp YYYY-MM-DDTHH:MM:SSZ"),
+]
+BATCH_HEADER_LINE = BATCH_DELIM.join(c[1] for c in BATCH_COLUMNS)
+
+# Records are fetched ONE at a time, in id order. Numbers / timestamps are rendered by the database
+# so their text form is fixed; every other value is passed through untouched.
+BATCH_FETCH_SQL = """
+SELECT id, account_number, holder_name, balance::text AS balance, status, last_txn_type,
+       last_txn_amount::text AS last_txn_amount,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+       to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
+FROM accounts WHERE id > $1::int ORDER BY id LIMIT 1
+"""
+
+# new job: starts after the last account of the newest COMPLETED job, only if there is something new.
+# The unique "one active job" index turns a concurrent insert into a no-op.
+BATCH_NEW_JOB_SQL = """
+INSERT INTO batch_jobs (status, start_account_id, last_account_id, owner, lease_until)
+SELECT 'RUNNING', s.m, s.m, $1::text, now() + make_interval(secs => $2::int)
+FROM (SELECT COALESCE(MAX(last_account_id), 0) AS m FROM batch_jobs WHERE status = 'COMPLETED') s
+WHERE EXISTS (SELECT 1 FROM accounts WHERE id > s.m)
+ON CONFLICT DO NOTHING
+RETURNING job_id
+"""
+
+# take over a RUNNING job whose lease expired (crashed / restarted process) -> continues at checkpoint
+BATCH_CLAIM_SQL = """
+UPDATE batch_jobs SET owner = $2::text, lease_until = now() + make_interval(secs => $3::int), updated_at = now()
+WHERE job_id = $1::int AND status = 'RUNNING' AND (lease_until IS NULL OR lease_until < now())
+RETURNING job_id
+"""
+
+# store one processed line + advance the checkpoint in ONE atomic statement (fenced by the lease owner)
+BATCH_RECORD_SQL = """
+WITH ins AS (
+    INSERT INTO batch_lines (job_id, record_no, file_no, account_id, line)
+    SELECT job_id, $2::int, next_file_no, $3::int, $4::text
+    FROM batch_jobs WHERE job_id = $1::int AND status = 'RUNNING' AND owner = $5::text
+)
+UPDATE batch_jobs
+SET last_account_id = $3::int, last_record_no = $2::int, processed_count = processed_count + 1,
+    file_line_count = file_line_count + 1,
+    lease_until = now() + make_interval(secs => $6::int), updated_at = now()
+WHERE job_id = $1::int AND status = 'RUNNING' AND owner = $5::text
+RETURNING job_id
+"""
+
+# formatting failure: pause. The file that was being written is closed (next record -> next file).
+# The checkpoint is NOT advanced, so every already processed record stays exactly as it is.
+BATCH_PAUSE_SQL = """
+UPDATE batch_jobs
+SET status = 'PAUSED', failure = $2::jsonb,
+    next_file_no = next_file_no + CASE WHEN file_line_count > 0 THEN 1 ELSE 0 END,
+    file_line_count = 0, owner = NULL, lease_until = NULL, updated_at = now()
+WHERE job_id = $1::int AND status = 'RUNNING' AND owner = $3::text
+RETURNING job_id
+"""
+
+# Skip & Resume: copy the failure into batch_skipped, move the checkpoint PAST the failing record,
+# and take the job back to RUNNING - all in one statement.
+BATCH_SKIP_SQL = """
+WITH j AS (
+    SELECT job_id, failure FROM batch_jobs
+    WHERE job_id = $1::int AND status = 'PAUSED' AND (failure->>'record_number')::int = $2::int
+), ins AS (
+    INSERT INTO batch_skipped (job_id, record_no, account_id, account_number, column_name, value_shown, issue, failed_at)
+    SELECT job_id, (failure->>'record_number')::int, (failure->>'db_id')::int, failure->>'account_number',
+           failure->>'column', failure->>'value', failure->>'issue', (failure->>'detected_at')::timestamptz
+    FROM j
+    ON CONFLICT DO NOTHING
+)
+UPDATE batch_jobs b
+SET status = 'RUNNING', last_account_id = (j.failure->>'db_id')::int,
+    last_record_no = (j.failure->>'record_number')::int, skipped_count = b.skipped_count + 1,
+    failure = NULL, owner = $3::text, lease_until = now() + make_interval(secs => $4::int), updated_at = now()
+FROM j WHERE b.job_id = j.job_id AND b.status = 'PAUSED'
+RETURNING b.job_id, b.next_file_no, b.last_record_no
+"""
+
+BATCH_COMPLETE_SQL = """
+UPDATE batch_jobs SET status = 'COMPLETED', owner = NULL, lease_until = NULL,
+       finished_at = now(), updated_at = now()
+WHERE job_id = $1::int AND status = 'RUNNING' AND owner = $2::text
+RETURNING job_id
+"""
+
+_batch_lock = threading.Lock()          # one batch execution per process at any time
+_batch_state_lock = threading.Lock()
+_batch_workbook_job = {"id": None}      # job whose final workbook was built successfully
+_batch_workbook_cache = {"id": None, "bytes": None}   # in memory only (never on disk)
+_batch_snapshot = {"enabled": BATCH_ENABLED, "status": "IDLE", "job_id": None, "processed": 0,
+                   "skipped": 0, "last_record": 0, "next_file": None, "files": [],
+                   "failure": None, "workbook_ready": False, "downloads": []}
+
+
+def _i(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _json(value):
+    if isinstance(value, (dict, list)) or value is None:
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _batch_file_name(file_no):
+    return f"batch_{int(file_no):03d}.txt"
+
+
+def _show(value, limit=120):
+    """Escaped, single-line, ASCII-only rendering of a value (so a bad character can be SEEN)."""
+    if value is None:
+        return "NULL"
+    s = ascii(str(value))
+    return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def _plain(value):
+    s = _show(value)
+    return s[1:-1] if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"" else s
+
+
+def _char_label(ch):
+    return f"U+{ord(ch):04X} {unicodedata.name(ch, 'unnamed character')}"
+
+
+def _field_issue(spec, text):
+    """Checks the rendered text of ONE column against its specification.
+    Returns (issue, position) or None. Position is 1-based within the value (0 = whole value)."""
+    column, _hdr, nullable, max_len, allowed, pattern, expected = spec
+    if text == "":
+        return None if nullable else ("empty value in a mandatory column", 0)
+    for pos, ch in enumerate(text, start=1):
+        o = ord(ch)
+        cat = unicodedata.category(ch)
+        if ch == "\r" or ch == "\n":
+            return (f"line break ({'CR' if ch == chr(13) else 'LF'}) inside the value at position {pos}; "
+                    f"it would split the record across TXT lines", pos)
+        if ch == "\t":
+            return (f"TAB character at position {pos}; it misaligns the TXT columns", pos)
+        if ch == BATCH_DELIM:
+            return (f"delimiter '{BATCH_DELIM}' inside the value at position {pos}; "
+                    f"it would add an extra column to the TXT line", pos)
+        if o == 0xFFFD:
+            return (f"encoding error: replacement character U+FFFD at position {pos} "
+                    f"(the source text was decoded incorrectly)", pos)
+        if o < 32 or o == 127 or cat in ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"):
+            return (f"invisible/control character {_char_label(ch)} at position {pos}", pos)
+        if o > 127:
+            return (f"non-ASCII character {_char_label(ch)} at position {pos}; it cannot be written to the "
+                    f"ASCII TXT file (encoding issue / unexpected symbol)", pos)
+    if text != text.strip(" "):
+        return ("leading or trailing space in the value", 1 if text.startswith(" ") else len(text))
+    if "  " in text:
+        return (f"consecutive spaces at position {text.index('  ') + 1}", text.index("  ") + 1)
+    if len(text) > max_len:
+        return (f"value is {len(text)} characters long, maximum for this column is {max_len}", max_len + 1)
+    for pos, ch in enumerate(text, start=1):
+        if not re.fullmatch(allowed, ch):
+            return (f"unexpected symbol {ch!r} at position {pos}; expected {expected}", pos)
+    if not re.fullmatch(pattern, text):
+        return (f"value does not match the required format; expected {expected}", 0)
+    return None
+
+
+def _validate_batch_record(row, job_id, record_no):
+    """Renders one account row as a TXT line and validates the RENDERED text.
+    Returns (line, None) when clean, or (None, failure_dict) for the first affected column."""
+    fields, problems = [], []
+    for spec in BATCH_COLUMNS:
+        raw = row.get(spec[0])
+        text = "" if raw is None else str(raw)
+        fields.append(text)
+        found = _field_issue(spec, text)
+        if found:
+            problems.append((spec, raw, found))
+
+    def failure(column, shown, issue, position):
+        return {
+            "job_id": job_id, "record_number": record_no, "db_id": _i(row.get("id")),
+            "account_number": _plain(row.get("account_number")), "column": column,
+            "value": shown, "issue": issue, "position": position,
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if problems:
+        spec, raw, (issue, position) = problems[0]
+        if len(problems) > 1:
+            issue += f" (+{len(problems) - 1} more invalid column(s): {', '.join(p[0][0] for p in problems[1:])})"
+        return None, failure(spec[0], _show(raw), issue, position)
+
+    # whole-line backstop: the line must split back into exactly the same columns and be pure ASCII
+    line = BATCH_DELIM.join(fields)
+    if "\r" in line or "\n" in line or line.split(BATCH_DELIM) != fields:
+        return None, failure("(whole line)", _show(line), "rendered line does not split back into the expected "
+                             f"{len(BATCH_COLUMNS)} columns", 0)
+    try:
+        line.encode("ascii")
+    except UnicodeEncodeError as e:
+        return None, failure("(whole line)", _show(line), f"line cannot be encoded as ASCII: {e.reason} "
+                             f"at offset {e.start}", e.start + 1)
+    return line, None
+
+
+def _batch_txt_bytes(lines):
+    """Notepad-compatible content: header + lines, CRLF endings, ASCII (valid UTF-8 as well)."""
+    return ("\r\n".join([BATCH_HEADER_LINE, *lines]) + "\r\n").encode("ascii")
+
+
+def get_batch_file_bytes(job_id, file_no):
+    """In-memory content of one TXT file (assembled from batch_lines on demand, never saved to disk).
+    Returns (file_name, bytes) or None. Ready to be served by a download endpoint - see NOTE below."""
+    rows = sql("SELECT line FROM batch_lines WHERE job_id = $1::int AND file_no = $2::int ORDER BY record_no",
+               [str(job_id), str(file_no)])
+    if not rows:
+        return None
+    return _batch_file_name(file_no), _batch_txt_bytes([r["line"] for r in rows])
+
+
+def build_batch_workbook(job_id):
+    """Final Excel workbook for a job, built entirely in memory (bytes are returned, nothing is saved):
+       sheet 'Processed Records' - every successfully processed record (with its TXT file name)
+       sheet 'Skipped Records'   - every skipped record with the exact failure details.
+    Downloads: no file is stored on disk. Closed TXT files and this workbook are published, base64
+    encoded, in the "downloads" list of the batch block of GET /health (admin token only); the alert
+    backend forwards it through GET /api/alerts/retail/status and the browser saves each item."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError as e:                                   # pragma: no cover
+        raise RuntimeError("openpyxl is not installed (add 'openpyxl' to requirements.txt)") from e
+    processed = sql("SELECT record_no, file_no, account_id, line FROM batch_lines "
+                    "WHERE job_id = $1::int ORDER BY record_no", [str(job_id)])
+    skipped = sql("SELECT record_no, account_id, account_number, column_name, value_shown, issue, "
+                  "to_char(failed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS failed_at, "
+                  "to_char(skipped_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS skipped_at "
+                  "FROM batch_skipped WHERE job_id = $1::int ORDER BY record_no", [str(job_id)])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Processed Records"
+    ws.append(["Record No", "TXT File", "DB ID", *[c[1] for c in BATCH_COLUMNS]])
+    for r in processed:
+        parts = str(r["line"]).split(BATCH_DELIM)
+        cells = []
+        for spec, p in zip(BATCH_COLUMNS, parts):
+            if spec[0] in ("balance", "last_txn_amount") and p:
+                try:
+                    p = float(Decimal(p))
+                except InvalidOperation:
+                    pass
+            cells.append(p if p != "" else None)
+        ws.append([_i(r["record_no"]), _batch_file_name(_i(r["file_no"])), _i(r["account_id"]), *cells])
+    for col in ("G", "I"):                                     # BALANCE, LAST_TXN_AMOUNT
+        for cell in ws[col][1:]:
+            cell.number_format = "0.00"
+
+    ws2 = wb.create_sheet("Skipped Records")
+    ws2.append(["Record No", "DB ID", "Account Number", "Column", "Value", "Failure Details",
+                "Failed At (UTC)", "Skipped At (UTC)"])
+    for r in skipped:
+        ws2.append([_i(r["record_no"]), _i(r["account_id"]), r["account_number"], r["column_name"],
+                    r["value_shown"], r["issue"], r["failed_at"], r["skipped_at"]])
+
+    for sheet in (ws, ws2):
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        sheet.freeze_panes = "A2"
+        for col in sheet.columns:
+            width = max(len(str(c.value)) if c.value is not None else 0 for c in col[:200])
+            sheet.column_dimensions[col[0].column_letter].width = min(max(12, width + 2), 80)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _download_item(job_id, name, mime, data, budget):
+    """One browser-download item. Content is base64 (JSON-safe) and lives in memory only."""
+    item = {"job_id": job_id, "name": name, "mime": mime, "size": len(data), "content_base64": None}
+    if len(data) <= budget[0]:
+        budget[0] -= len(data)
+        item["content_base64"] = base64.b64encode(data).decode("ascii")
+    else:
+        item["omitted"] = f"larger than the remaining BATCH_DOWNLOAD_MAX_BYTES budget"
+    return item
+
+
+def _batch_downloads(job_id, status, next_file_no, files):
+    """Files the browser should save automatically: every CLOSED TXT file (all of them once the job is
+    COMPLETED) plus the final Excel workbook after completion. Built from the database on demand."""
+    budget = [BATCH_DOWNLOAD_MAX_BYTES]
+    out = []
+    for f in files:
+        n = _i(f["file_no"])
+        if status != "COMPLETED" and n >= next_file_no:
+            continue                      # the file still being written is not final yet
+        got = get_batch_file_bytes(job_id, n)
+        if got:
+            out.append(_download_item(job_id, got[0], "text/plain", got[1], budget))
+    if status == "COMPLETED":
+        if _batch_workbook_cache["id"] != job_id:
+            _batch_workbook_cache.update(id=job_id, bytes=build_batch_workbook(job_id))
+        _batch_workbook_job["id"] = job_id
+        out.append(_download_item(
+            job_id, f"batch_final_job{job_id}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", _batch_workbook_cache["bytes"], budget))
+    return out
+
+
+def _refresh_batch_snapshot():
+    """Rebuilds the status block published in GET /health from the database. Never raises."""
+    try:
+        rows = sql("SELECT * FROM batch_jobs ORDER BY job_id DESC LIMIT 1")
+        if not rows:
+            snap = {"enabled": BATCH_ENABLED, "status": "IDLE", "job_id": None, "processed": 0, "skipped": 0,
+                    "last_record": 0, "next_file": None, "files": [], "failure": None, "workbook_ready": False,
+                    "downloads": []}
+        else:
+            job = rows[0]
+            jid = _i(job["job_id"])
+            files = sql("SELECT file_no, COUNT(*) AS records FROM batch_lines WHERE job_id = $1::int "
+                        "GROUP BY file_no ORDER BY file_no", [str(jid)])
+            status = job["status"]
+            try:
+                downloads = _batch_downloads(jid, status, _i(job["next_file_no"]), files)
+            except Exception as e:
+                downloads = []
+                log.error("BATCH download files could not be prepared: %s", e)
+            snap = {
+                "enabled": BATCH_ENABLED, "status": status, "job_id": jid,
+                "processed": _i(job["processed_count"]), "skipped": _i(job["skipped_count"]),
+                "last_record": _i(job["last_record_no"]),
+                "next_file": _batch_file_name(_i(job["next_file_no"])) if status != "COMPLETED" else None,
+                "files": [{"name": _batch_file_name(_i(f["file_no"])), "records": _i(f["records"])} for f in files],
+                "failure": _json(job.get("failure")) if status == "PAUSED" else None,
+                "workbook_ready": status == "COMPLETED" and _batch_workbook_job["id"] == jid,
+                "downloads": downloads,
+            }
+        with _batch_state_lock:
+            _batch_snapshot.clear()
+            _batch_snapshot.update(snap)
+    except Exception as e:
+        log.error("BATCH status refresh failed: %s", e)
+
+
+def _batch_public_status(is_admin):
+    with _batch_state_lock:
+        snap = dict(_batch_snapshot)
+    if not is_admin:
+        snap["failure"] = None      # exact value of the bad record and the file contents are only for the admin/alert module
+        snap["downloads"] = []
+    return snap
+
+
+def _process_batch_job(job_id, owner):
+    """Sequentially handles the job's records. Returns when the job is paused, completed, or
+    the lease was lost. The caller must hold _batch_lock."""
+    rows = sql("SELECT * FROM batch_jobs WHERE job_id = $1::int", [str(job_id)])
+    if not rows or rows[0]["status"] != "RUNNING" or rows[0]["owner"] != owner:
+        return
+    job = rows[0]
+    last_id, rec_no = _i(job["last_account_id"]), _i(job["last_record_no"])
+    file_no, file_lines = _i(job["next_file_no"]), _i(job["file_line_count"])
+    log.info("BATCH job %s processing from record %s into %s", job_id, rec_no + 1, _batch_file_name(file_no))
+    _refresh_batch_snapshot()
+
+    while True:
+        fetched = sql(BATCH_FETCH_SQL, [str(last_id)])
+        if not fetched:
+            break
+        row = fetched[0]
+        rec_no += 1
+        db_id = _i(row["id"])
+        line, failure = _validate_batch_record(row, job_id, rec_no)
+        if failure:
+            closed = _batch_file_name(file_no) if file_lines > 0 else None
+            nxt = _batch_file_name(file_no + (1 if file_lines > 0 else 0))
+            failure["closed_file"], failure["next_file"] = closed, nxt
+            if not sql(BATCH_PAUSE_SQL, [str(job_id), json.dumps(failure), owner]):
+                log.error("BATCH job %s lost its lease while pausing - stopping this execution", job_id)
+                return
+            log.error("BATCH PROCESSING FAILURE job=%s record=%s db_id=%s account=%s column=%s value=%s "
+                      "issue=%s | job PAUSED, %s record(s) kept%s, waiting for Skip & Resume approval",
+                      job_id, rec_no, db_id, failure["account_number"], failure["column"], failure["value"],
+                      failure["issue"], file_lines, f" in {closed}" if closed else "")
+            _refresh_batch_snapshot()
+            return
+        if not sql(BATCH_RECORD_SQL, [str(job_id), str(rec_no), str(db_id), line, owner, str(BATCH_LEASE_SECONDS)]):
+            log.error("BATCH job %s lost its lease - stopping this execution", job_id)
+            return
+        last_id, file_lines = db_id, file_lines + 1
+        if BATCH_RECORD_DELAY_SECONDS > 0:
+            time.sleep(BATCH_RECORD_DELAY_SECONDS)
+
+    if not sql(BATCH_COMPLETE_SQL, [str(job_id), owner]):
+        log.error("BATCH job %s lost its lease before completion - stopping this execution", job_id)
+        return
+    try:
+        _batch_workbook_cache.update(id=job_id, bytes=build_batch_workbook(job_id))
+        _batch_workbook_job["id"] = job_id
+        wb_note = f"final Excel workbook built in memory ({len(_batch_workbook_cache['bytes'])} bytes)"
+    except Exception as e:
+        wb_note = f"final Excel workbook could NOT be built: {e}"
+        log.error("BATCH job %s %s", job_id, wb_note)
+    log.info("BATCH job %s COMPLETED: %s record(s) handled, %s", job_id, rec_no, wb_note)
+    _refresh_batch_snapshot()
+
+
+def _run_batch_job(job_id, owner):
+    """Thread entry used after Skip & Resume. Waits for the process-wide lock, then continues the job."""
+    if not _batch_lock.acquire(timeout=30):
+        log.warning("BATCH job %s resume is waiting for the running execution; the scheduler will pick it up", job_id)
+        return
+    try:
+        _process_batch_job(job_id, owner)
+    except Exception as e:
+        log.error("BATCH job %s execution failed: %s", job_id, e)
+    finally:
+        _batch_lock.release()
+        _refresh_batch_snapshot()
+
+
+def _batch_tick():
+    """One scheduled execution. Never overlaps with another one."""
+    if not _batch_lock.acquire(blocking=False):
+        log.warning("BATCH scheduled run skipped: the previous execution is still running")
+        return
+    try:
+        owner = uuid.uuid4().hex
+        active = sql("SELECT job_id, status FROM batch_jobs WHERE status IN ('RUNNING','PAUSED') "
+                     "ORDER BY job_id DESC LIMIT 1")
+        if active:
+            jid = _i(active[0]["job_id"])
+            if active[0]["status"] == "PAUSED":
+                log.info("BATCH job %s is PAUSED - waiting for Skip & Resume approval", jid)
+                _refresh_batch_snapshot()
+                return
+            if not sql(BATCH_CLAIM_SQL, [str(jid), owner, str(BATCH_LEASE_SECONDS)]):
+                log.info("BATCH job %s is still held by a live execution - scheduled run skipped", jid)
+                return
+            log.warning("BATCH job %s recovered from its checkpoint after an interrupted execution", jid)
+            _process_batch_job(jid, owner)
+            return
+        created = sql(BATCH_NEW_JOB_SQL, [owner, str(BATCH_LEASE_SECONDS)])
+        if not created:
+            log.info("BATCH nothing to process: no account records after the last completed job")
+            return
+        _process_batch_job(_i(created[0]["job_id"]), owner)
+    except Exception as e:
+        log.error("BATCH scheduled run failed: %s", e)
+    finally:
+        _batch_lock.release()
+        _refresh_batch_snapshot()
+
+
+def batch_scheduler_loop():
+    time.sleep(BATCH_START_DELAY_SECONDS)   # let the server come up
+    log.info("BATCH scheduler started (every %ss)", BATCH_INTERVAL_SECONDS)
+    while True:
+        _batch_tick()
+        time.sleep(BATCH_INTERVAL_SECONDS)
+
+
+def batch_skip_and_resume(job_id=0, record_no=0):
+    """Skip & Resume (approved by a person). Skips the record the job is paused on and resumes from
+    the next database record in a NEW sequentially numbered TXT file."""
+    if not BATCH_ENABLED:
+        raise HTTPException(404, "batch processing is disabled")
+    paused = sql("SELECT job_id, failure FROM batch_jobs WHERE status = 'PAUSED' ORDER BY job_id DESC LIMIT 1")
+    if not paused:
+        raise HTTPException(409, "No paused batch job - nothing to skip")
+    jid, failure = _i(paused[0]["job_id"]), _json(paused[0]["failure"]) or {}
+    rec = _i(failure.get("record_number"))
+    if job_id and job_id != jid:
+        raise HTTPException(409, f"Paused job is {jid}, not {job_id}")
+    if record_no and record_no != rec:
+        raise HTTPException(409, f"Job {jid} is paused on record {rec}, not {record_no}")
+    owner = uuid.uuid4().hex
+    res = sql(BATCH_SKIP_SQL, [str(jid), str(rec), owner, str(BATCH_LEASE_SECONDS)])
+    if not res:
+        raise HTTPException(409, "The paused job changed or was already resumed")
+    next_file = _batch_file_name(_i(res[0]["next_file_no"]))
+    log.warning("BATCH Skip & Resume approved: job=%s skipped record=%s account=%s column=%s; resuming from "
+                "record %s into %s", jid, rec, failure.get("account_number"), failure.get("column"),
+                rec + 1, next_file)
+    _refresh_batch_snapshot()
+    threading.Thread(target=_run_batch_job, args=(jid, owner), daemon=True).start()
+    return {"restarted": BATCH_COMPONENT, "action": "skip_and_resume", "status": "RUNNING", "job_id": jid,
+            "skipped_record": rec, "skipped_account": failure.get("account_number"),
+            "resumed_from_record": rec + 1, "next_file": next_file}
+
+
+# --------------------------------------------------------------------------
 # App + APIs
 # --------------------------------------------------------------------------
 @asynccontextmanager
@@ -350,6 +951,9 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=disk_log_loop, daemon=True).start()
     if CLIENT_ENABLED:
         threading.Thread(target=client_loop, daemon=True).start()
+    if BATCH_ENABLED:
+        _refresh_batch_snapshot()
+        threading.Thread(target=batch_scheduler_loop, daemon=True).start()
     yield
 
 
@@ -363,13 +967,17 @@ class Transaction(BaseModel):
 
 
 @app.get("/health")
-def health():
+def health(x_admin_token: str = Header(default="")):
+    # "apis" is unchanged. "batch" is the batch-job status (served from memory, no DB call). The exact
+    # failing value and "downloads" (closed TXT files + final Excel as base64, for the browser to save
+    # automatically) are only included when the caller sends a valid X-Admin-Token (or none is configured).
     return {
         "status": "ok",
         "apis": {
             "get_account": flaky.is_up("get_account"),
             "post_transactions": flaky.is_up("post_transactions"),
         },
+        "batch": _batch_public_status(not ADMIN_TOKEN or x_admin_token == ADMIN_TOKEN),
     }
 
 
@@ -411,10 +1019,14 @@ def post_transaction(txn: Transaction):
 
 
 @app.post("/admin/restart/{api_name}")
-def restart_api(api_name: str, x_admin_token: str = Header(default="")):
+def restart_api(api_name: str, job_id: int = 0, record_no: int = 0, x_admin_token: str = Header(default="")):
     """Restart hook used by the alert module. Protected by X-Admin-Token when ADMIN_TOKEN is set.
-    Only touches the API state - never logs or disk."""
+    For the flaky API it only touches the API state - never logs or disk.
+    For 'batch_processing' it is the approved "Skip & Resume" of a paused batch job
+    (optional job_id / record_no make sure the approval is for the record the person saw)."""
     _check_admin(x_admin_token)
+    if api_name == BATCH_COMPONENT:
+        return batch_skip_and_resume(job_id, record_no)
     if api_name != flaky.api_name:
         raise HTTPException(404, f"'{api_name}' is not the managed flaky API")
     flaky.start()
