@@ -673,7 +673,10 @@ def _txt_defect_records(job):
     if not k:
         return set()
     n = _i(sql("SELECT COUNT(*) AS n FROM accounts WHERE id > $1::int", [str(_i(job["start_account_id"]))])[0]["n"])
-    return set(random.Random(_i(job["job_id"])).sample(range(1, n + 1), min(k, n))) if n else set()
+    if not n:
+        return set()
+    first = 2 if n > 1 else 1                  # keep record 1 clean: the first TXT file then holds records before the error
+    return set(random.Random(_i(job["job_id"])).sample(range(first, n + 1), min(k, n - first + 1)))
 
 
 def _apply_txt_defect(row):
